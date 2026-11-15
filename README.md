@@ -89,16 +89,42 @@ and commits them to `main`. zode.dev/benchmark reads `site/ci.json` from
 this repository, so the page follows the newest week without a deploy.
 `site/index.json` lists every published week.
 
-`scripts/site-data.py` picks, for each repository, provider and mode, the
-median run by wall time (the lower middle one when the count is even) and
-shows that run's own wall, queue, run time and price with its link, so every
-number on the page is one real run. Runs that passed come first; a cell with
-no passed run says so. GitHub's price is the list price of the same machine
+## How the numbers are measured
+
+`scripts/site-data.py` and `scripts/report.py` follow these rules:
+
+- **End to end** is dispatch to the last job done: what a developer waits
+  for. It splits into **queued** (dispatch to the first job starting) and
+  **run** (first job starting to the last job done), so queued plus run is end
+  to end for every run.
+- Each is reported as **P50 and P95** (nearest rank) over every run of one
+  repository, machine and cache state, with the run count and the days the
+  runs span. No single best run is a result. Each cell links one run near
+  the P50 so you can open it, but that run is not the number.
+- **Runner minutes and price are the bill**: every job's run time added up.
+  A workflow with four parallel jobs bills four times what the developer
+  waits. The bill is its own axis and is never added to a wait time.
+- **Machines are named exactly**: `ubuntu-24.04` (GitHub-hosted, 4 vCPU,
+  16 GB on a public repository) against `zode-4x8` (4 vCPU, 8 GB). The
+  machine of every cell is in the data.
+- **Cache state is stated for both sides**: cold deletes the branch's
+  Actions caches before the run, warm runs right after with what cold saved.
+  The two providers run the same mode side by side.
+- **Small samples are labelled**: a cell with fewer than 20 runs is marked
+  `small_sample`, and so is every comparison that uses one. A weekly run is
+  3 runs a cell, so a single week is always a small sample; pass several
+  results directories (`scripts/site-data.py results/a results/b ...`) to
+  pool weeks of the same pinned commits into one sample.
+- The win, loss or even call per repository compares P50 end to end (within
+  5% is even) and shows the P95 ratio next to it.
+
+Runs that passed are used; a cell with no passed run uses the failed runs and
+says so. GitHub's price is the list price of the same machine
 for a private repository (Linux 4-core larger runner, $0.012 a minute, each
 job rounded up to the minute; public repositories run free). Zode's is what
 the run was billed, from the Zode API; when a job ran on a runner started
-for another run its bill sits there, and the cell shows an estimate from
-run time at $0.045 an hour instead.
+for another run its bill sits there, and the run is priced from its run time
+at $0.045 an hour instead and marked an estimate.
 
 Selected-test runs and sharded runs are separate columns on the page and
 stay pending until Enforce (task 43) and the shard proof (task 41) exist:
@@ -144,7 +170,7 @@ scripts/site-data.py results/mine
 
 GitHub-hosted runs need only `gh`. Zode runs need a Zode workspace with the
 Zode GitHub App on the mirror and its token in `ZODE_TOKEN`. The published
-median should land within 15% of yours.
+P50 should land within 15% of yours.
 
 ## Output
 
@@ -166,8 +192,9 @@ provider:
 ```
 
 `zode` is null for GitHub-hosted jobs. `wall_s` is dispatch to the last job
-done; `queue_s_max` is the longest job's GitHub queue time (created to
-started); `run_s_sum` is the jobs' summed run time.
+done (end to end); `queue_s_max` is the longest job's GitHub queue time
+(created to started); `run_s_sum` is the jobs' summed run time, which is
+runner minutes (the bill), not a wait.
 
 ## Caveats
 
