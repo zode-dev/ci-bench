@@ -3,16 +3,25 @@
 
   scripts/report.py results/<date>     writes summary.json and report.md there
 
-Per repository, provider and mode: runs, successes, median wall time
-(dispatch to last job done), median longest job queue, median summed job
-run time. For Zode jobs, the median of every REQ-050 phase, and the check
-that the stored phases add up to GitHub's own queue plus run time.
+Per repository, provider and mode: runs, successes, the days they span,
+and P50 and P95 of end to end (dispatch to the last job done), queued
+(dispatch to the first job starting) and run (first job starting to the
+last job done). Runner minutes (the jobs' run time added up) are the bill
+and are reported apart, never added to a wait. A cell under 20 runs is
+marked a small sample. For Zode jobs, the median of every REQ-050 phase,
+and the check that the stored phases add up to GitHub's own queue plus run
+time.
 """
+import importlib.util
 import json
 import os
 import statistics
 import sys
 from collections import defaultdict
+
+_spec = importlib.util.spec_from_file_location("site_data", os.path.join(os.path.dirname(os.path.abspath(__file__)), "site-data.py"))
+sd = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(sd)
 
 PHASES = ["webhook", "dispatch", "sandbox", "runner_boot", "assign", "setup", "steps"]
 
@@ -49,13 +58,13 @@ def main(d):
         groups[(r["repo"], r["provider"], r["mode"])].append(r)
     rows = []
     for (repo, prov, mode), all_rs in sorted(groups.items()):
-        rs = [r for r in all_rs if r["conclusion"] == "success"] or all_rs
+        c = sd.cell(all_rs, mode)
         rows.append({
-            "repo": repo, "provider": prov, "runner": rs[0]["runner"], "mode": mode, "runs": len(all_rs),
-            "success": sum(1 for r in all_rs if r["conclusion"] == "success"),
-            "wall_s_median": med([r["wall_s"] for r in rs]),
-            "queue_s_max_median": med([r["queue_s_max"] for r in rs]),
-            "run_s_sum_median": med([r["run_s_sum"] for r in rs]),
+            "repo": repo, "provider": prov, "runner": c["runner"], "machine": c["machine"], "mode": mode,
+            "runs": c["runs"], "success": c["passed"], "used": c["used"], "days": c["days"],
+            "small_sample": c["small_sample"],
+            "end_to_end_s": c["end_to_end_s"], "queued_s": c["queued_s"], "run_s": c["run_s"],
+            "runner_minutes": c["runner_minutes"],
         })
     # Zode phases, per mode, over every job that ran
     zjobs = defaultdict(list)
@@ -99,23 +108,39 @@ def main(d):
                "github_queue": gh_queue, "req050_check": check}
     json.dump(summary, open(os.path.join(d, "summary.json"), "w"), indent=1)
 
+    days = len({r["dispatched_at"][:10] for r in recs if r.get("dispatched_at")})
+    small = any(r["small_sample"] for r in rows)
+    pp = lambda x: "n/a" if x is None or x["p50"] is None else "%gs / %gs" % (x["p50"], x["p95"])
     out = ["# ci-bench results: %s" % os.path.basename(os.path.normpath(d)), "",
-           "%d runs. Wall is dispatch to the last job done; queue is the longest job's GitHub queue time; "
-           "run is the jobs' summed run time. Medians over the runs that passed (over all runs when none "
-           "passed)." % len(recs), "",
-           "| Repo | Mode | GitHub wall | Zode wall | GitHub queue | Zode queue | GitHub run | Zode run | Passed (GitHub / Zode) |",
-           "|---|---|---|---|---|---|---|---|---|"]
+           "%d runs over %d days. Each cell is P50 / P95 over the runs that passed (over all runs when none passed). "
+           "End to end is dispatch to the last job done; it is queued (dispatch to the first job starting) plus run "
+           "(first job starting to the last job done). Runner minutes are the bill, every job's run time added up, "
+           "and are never added to a wait. Percentiles do not add: the P50s of queued and run need not sum to the P50 of end to end. Machines: %s. Cache state is the Mode column, the same on both sides."
+           % (len(recs), days, "; ".join(sorted({"%s = %s" % (r["runner"], r["machine"]) for r in rows}))), ""]
+    if small:
+        out += ["Small sample: every cell here has fewer than %d runs, so P95 is close to the slowest run." % sd.MIN_SAMPLE, ""]
+    out += ["### Developer wait (P50 / P95)", "",
+            "| Repo | Mode | Runs (GitHub / Zode) | GitHub end to end | Zode end to end | GitHub queued | Zode queued | GitHub run | Zode run |",
+            "|---|---|---|---|---|---|---|---|---|"]
     by = {(r["repo"], r["provider"], r["mode"]): r for r in rows}
+    pairs = []
     for repo in sorted({r["repo"] for r in rows}):
         for mode in ("cold", "warm"):
             g, z = by.get((repo, "github", mode)), by.get((repo, "zode", mode))
-            if not g and not z:
-                continue
-            gv = lambda r, k: fmt(r[k]) if r else "n/a"
-            out.append("| %s | %s | %s | %s | %s | %s | %s | %s | %s / %s |" % (
-                repo, mode, gv(g, "wall_s_median"), gv(z, "wall_s_median"), gv(g, "queue_s_max_median"),
-                gv(z, "queue_s_max_median"), gv(g, "run_s_sum_median"), gv(z, "run_s_sum_median"),
-                "%d/%d" % (g["success"], g["runs"]) if g else "n/a", "%d/%d" % (z["success"], z["runs"]) if z else "n/a"))
+            if g or z:
+                pairs.append((repo, mode, g, z))
+    cnt = lambda r: "%d/%d" % (r["success"], r["runs"]) if r else "n/a"
+    gv = lambda r, k: pp(r[k]) if r else "n/a"
+    for repo, mode, g, z in pairs:
+        out.append("| %s | %s | %s / %s | %s | %s | %s | %s | %s | %s |" % (
+            repo, mode, cnt(g), cnt(z), gv(g, "end_to_end_s"), gv(z, "end_to_end_s"), gv(g, "queued_s"),
+            gv(z, "queued_s"), gv(g, "run_s"), gv(z, "run_s")))
+    mm = lambda x: "n/a" if x is None or x["p50"] is None else "%g / %g" % (x["p50"], x["p95"])
+    out += ["", "### Runner minutes, the bill (P50 / P95, a separate axis)", "",
+            "| Repo | Mode | GitHub | Zode |", "|---|---|---|---|"]
+    for repo, mode, g, z in pairs:
+        out.append("| %s | %s | %s | %s |" % (repo, mode, mm(g["runner_minutes"]) if g else "n/a",
+                                             mm(z["runner_minutes"]) if z else "n/a"))
     out += ["", "## Zode phases (median ms over every job that ran)", "",
             "| Mode | Jobs | webhook | dispatch | sandbox | runner_boot | assign | setup | steps | queue (p50 / p95) |",
             "|---|---|---|---|---|---|---|---|---|---|"]
